@@ -206,7 +206,39 @@ page, and in a test with $S$ already touched, $QK^\top$ dropped from 65\,ms to 4
 these costs come from materialising $S$, which is what fusion in (c) removes.
 
 \subsection*{(c) Fusion}
-\todo{}
+
+\texttt{attn\_fused.c} runs all three steps for one block of rows before moving to the next, so
+only the scores of the current block are stored. I first tried literally one row at a time,
+with an $N$-float score buffer. It passed, but at $d=128$ it took 726\,ms, slower than
+\texttt{attn\_tiled.c}, because every row streamed all of $K^\top$ and $V$ (2\,MiB each, the
+whole L3). Processing $B$ rows together reuses each pass over $K^\top$ and $V$ for $B$ rows, and
+inside the block the steps use the same $8 \times 8$ register tiles as (b). I measured $B = 8$,
+16, 32 and 64; $B=64$ was fastest or equal on every input (269\,ms at $d=128$, against 462\,ms
+for $B=8$), so the score buffer is $64 \times N$ floats (1\,MiB at $N=4096$) instead of 64\,MiB.
+Instead of dividing every score by the row sum, each output row is multiplied by $1/\text{sum}$
+once at the end. This changes the rounding slightly, so \texttt{make check} now reports a small
+non-zero error (at most $6.2\times10^{-6}$).
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Input & Time (ms) & GFLOP/s & \% of $P_1$ & vs.\ naive & vs.\ tiled \\
+\midrule
+$N=1024,\ d=64$  & 8.6   & 31.18 & 22.7 & $\times15.04$ & $\times1.33$ \\
+$N=2048,\ d=64$  & 35.8  & 29.97 & 21.8 & $\times14.65$ & $\times1.17$ \\
+$N=4096,\ d=64$  & 150.9 & 28.46 & 20.7 & $\times14.33$ & $\times1.50$ \\
+$N=4096,\ d=128$ & 268.6 & 31.98 & 23.2 & $\times19.16$ & $\times1.24$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Removing the $N \times N$ matrix removes the costs that came with it: page faults at
+$N=4096,\ d=64$ fall from 99{,}157 to 3{,}283 per 6 calls, and $QK^\top$ drops from 72\,ms to
+48\,ms. Softmax also gets faster (70\,ms to 49\,ms), since its block of scores is now in cache
+instead of DRAM. The three steps now take similar time (48\,ms $QK^\top$, 49\,ms softmax and
+44\,ms $PV$), so the scalar \texttt{expf} in softmax is as large a cost as either matmul, and
+the matmuls still run below half of peak.
+
 \subsection*{(d) Best}
 \todo{}
 
