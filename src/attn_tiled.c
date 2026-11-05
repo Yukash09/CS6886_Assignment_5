@@ -19,11 +19,84 @@
 /* ------------------------------------------------------------------------- */
 /* attention(): write your implementation here.                               */
 /* ------------------------------------------------------------------------- */
+#define R 8 
+#define C 8 
+#define IB 64
+
 void attention(const float *Q, const float *K, const float *V, float *O, int N, int d)
 {
-    (void)Q; (void)K; (void)V; (void)O; (void)N; (void)d;
-    printf("attn_tiled: not implemented yet\n");
-    exit(0); /* no output file is written, so `make check` skips this variant */
+    const float scale = 1.0f / sqrtf((float)d);
+    float *S = malloc((size_t)N * N * sizeof(float));
+    float *Kt = malloc((size_t)d * (N+16) * sizeof(float)) ; 
+
+    /* 1. S = Q K^T * scale */
+    for(int j = 0 ; j < N ; j++){
+        for(int k = 0 ; k < d ; k++){
+            Kt[k*(N+16) + j] = K[j*d + k] ; 
+        }
+    }
+
+    for(int i0 = 0 ; i0 < N ; i0 += IB){
+        for(int j = 0 ; j < N ; j += C){
+            for(int i = i0 ; i < i0 + IB ; i += R){
+                float acc[R][C] = {{0}} ; 
+                for(int k = 0 ; k < d ; k++){
+                    for(int r = 0 ; r < R ; r++){
+                        float q = Q[(size_t)(i+r)*d + k] ; 
+                        for(int c = 0 ; c < C ; c++){
+                            acc[r][c] += q*Kt[(size_t)k*(N+16) + j + c] ; 
+                        }
+                    }
+                }
+                for(int r = 0 ; r < R ; r++){
+                    for(int c = 0 ; c < C ; c++){
+                        S[(size_t)(i+r)*N + j + c] = acc[r][c] * scale ; 
+                    }
+                }                
+            }
+        }
+    }
+
+    /* 2. softmax of each row of S */
+    for (int i = 0; i < N; i++) {
+        float *row = S + (size_t)i * N;
+        float max = row[0];
+        for (int j = 1; j < N; j++)
+            if (row[j] > max)
+                max = row[j];
+        float sum = 0.0f;
+        for (int j = 0; j < N; j++) {
+            row[j] = expf(row[j] - max);
+            sum += row[j];
+        }
+        for (int j = 0; j < N; j++)
+            row[j] = row[j] / sum;
+    }
+
+    /* 3. O = S V */
+
+    for(int i0 = 0 ; i0 < N ; i0 += IB){
+        for(int k0 = 0 ; k0 < d ; k0 += C){
+            for(int i = i0 ; i < i0 + IB ; i += R){
+                float acc[R][C] = {{0}} ; 
+                for(int j = 0 ; j < N ; j++){
+                    for(int r = 0 ; r < R ; r++){
+                        float q = S[(size_t)(i+r)*N + j] ; 
+                        for(int c = 0 ; c < C ; c++){
+                            acc[r][c] += q*V[(size_t)j*d + k0 + c] ; 
+                        }
+                    }
+                }
+                for(int r = 0 ; r < R ; r++){
+                    for(int c = 0 ; c < C ; c++){
+                        O[(size_t)(i+r)*d + k0 + c] = acc[r][c] ; 
+                    }
+                }                
+            }
+        }
+    }
+    free(Kt) ; 
+    free(S);
 }
 
 /* ------------------------------------------------------------------------- */

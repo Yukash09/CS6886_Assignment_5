@@ -23,33 +23,34 @@ void attention(const float *Q, const float *K, const float *V, float *O, int N, 
 {
     const float scale = 1.0f / sqrtf((float)d);
     float *S = malloc((size_t)N * N * sizeof(float));
-    float *Kt = malloc((size_t)d * N * sizeof(float)); /* K transposed: d x N */
+    float *Kt = malloc((size_t)d * N * sizeof(float));
 
-    /* 0. Kt[k][j] = K[j][k], so step 1 can read K contiguously along j.
-     *    O(N d) work, negligible next to the O(N^2 d) matmuls. */
-    for (int j = 0; j < N; j++)
-        for (int k = 0; k < d; k++)
+    /* 1. S = Q K^T * scale */
+    for (int j = 0; j < N; j++){
+        for (int k = 0; k < d; k++){
             Kt[(size_t)k * N + j] = K[(size_t)j * d + k];
+        }
+    }
 
-    /* 1. S = Q K^T * scale, loop order i -> k -> j.
-     *    Inner j loop: S[i][j] += Q[i][k] * Kt[k][j]. Each j writes a different
-     *    S[i][j] (no reduction) and both S and Kt are contiguous in j, so it
-     *    vectorises without reordering any sum. */
     for (int i = 0; i < N; i++) {
         float *Si = S + (size_t)i * N;
-        for (int j = 0; j < N; j++)
-            Si[j] = 0.0f;
+        for (int j = 0; j < N; j++){
+             Si[j] = 0.0f;           
+        }
+
         for (int k = 0; k < d; k++) {
             const float q = Q[(size_t)i * d + k];
             const float *Ktk = Kt + (size_t)k * N;
-            for (int j = 0; j < N; j++)
+            for (int j = 0; j < N; j++){
                 Si[j] += q * Ktk[j];
+            }
         }
-        for (int j = 0; j < N; j++)
+        for (int j = 0; j < N; j++){
             Si[j] *= scale;
+        }
     }
 
-    /* 2. softmax of each row of S (unchanged) */
+    /* 2. softmax of each row of S */
     for (int i = 0; i < N; i++) {
         float *row = S + (size_t)i * N;
         float max = row[0];
@@ -65,18 +66,20 @@ void attention(const float *Q, const float *K, const float *V, float *O, int N, 
             row[j] = row[j] / sum;
     }
 
-    /* 3. O = S V, loop order i -> j -> k.
-     *    Inner k loop: O[i][k] += S[i][j] * V[j][k]. Each k writes a different
-     *    O[i][k] and both O and V are contiguous in k. */
+    /* 3. O = S V */
+
     for (int i = 0; i < N; i++) {
         float *Oi = O + (size_t)i * d;
-        for (int k = 0; k < d; k++)
+        for (int k = 0; k < d; k++){
             Oi[k] = 0.0f;
+        }
+
         for (int j = 0; j < N; j++) {
             const float s = S[(size_t)i * N + j];
             const float *Vj = V + (size_t)j * d;
-            for (int k = 0; k < d; k++)
+            for (int k = 0; k < d; k++){
                 Oi[k] += s * Vj[k];
+            }
         }
     }
 

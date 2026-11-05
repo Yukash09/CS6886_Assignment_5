@@ -131,9 +131,80 @@ DRAM, roughly 0.27\,GB or 33\,ms at 8.06\,GB/s, which is under 2\% of the runtim
 % ===========================================================================
 \section*{Q3: Optimisations}
 \subsection*{(a) Loop reordering}
-\todo{}
+
+Both matmuls in naive put the sum over the shared index innermost, which the compiler cannot
+vectorise without reordering FP additions. In \texttt{attn\_loops.c} I moved that index out of
+the inner loop, so that the inner loop updates a different output element on every iteration
+and reads memory contiguously. For $PV$ the order becomes $i \to j \to k$, with the inner loop
+\texttt{O[i][k] += S[i][j] * V[j][k]}. For $QK^\top$ no loop order is contiguous in $K$ while
+avoiding a reduction, so I first copy $K$ into a transposed $d \times N$ array $K^\top$ (an
+$O(Nd)$ step, 1.5\,ms at $N=4096$) and use $i \to k \to j$ with
+\texttt{S[i][j] += Q[i][k] * Kt[k][j]}. clang now reports both inner loops as vectorised (width 8,
+interleave 4). Since each output element still accumulates its terms in the same order as
+naive, \texttt{make check} passes with an error of exactly 0.
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Input & Time (ms) & GFLOP/s & \% of $P_1$ & Speedup \\
+\midrule
+$N=1024,\ d=64$  & 14.8  & 18.14 & 13.2 & $\times8.75$ \\
+$N=2048,\ d=64$  & 64.6  & 16.62 & 12.1 & $\times8.12$ \\
+$N=4096,\ d=64$  & 264.2 & 16.26 & 11.8 & $\times8.19$ \\
+$N=4096,\ d=128$ & 420.8 & 20.41 & 14.8 & $\times12.23$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At $N=4096,\ d=64$ the steps now take 107\,ms ($QK^\top$, 20\,GFLOP/s), 81\,ms ($PV$,
+27\,GFLOP/s) and 64\,ms (softmax), so softmax has grown from 3\% to 25\% of the time. The matmuls
+are still far from peak for two reasons. First, every vector FMA in the inner loop needs two
+loads and one store (the accumulator \texttt{S[i][j]} or \texttt{O[i][k]} lives in memory, not
+in a register), and a Zen 2 core can do only two loads and one store per cycle, which caps the
+loop at one FMA per cycle, half of peak, even when everything hits in L1. Second, each row $i$
+streams the whole of $K^\top$ (or $V$), 1\,MiB at $N=4096,\ d=64$, which does not fit in the
+512\,KiB L2, so it is re-read from L3 for every row. Register tiling and cache tiling in (b)
+address these two limits.
+
 \subsection*{(b) Cache and register tiling}
-\todo{}
+
+\texttt{attn\_loops.c} keeps every partial sum in memory, so each vector FMA needs two loads and
+a store. In \texttt{attn\_tiled.c} each matmul instead computes an $8 \times 8$ block of the
+output at a time in a local array \texttt{acc[8][8]}. Because the tile size is a compile-time
+constant, clang unrolls the tile loops and keeps the block in eight vector registers; the inner
+loop then loads one 8-wide row of $K^\top$ (or $V$) and broadcasts eight scalars of $Q$ (or $P$),
+and the outputs are stored only once per tile. Eight independent accumulators also hide most of
+the FMA latency. For cache tiling, rows are processed in blocks of 64, so that the small slice of
+$K^\top$ or $V$ used by a tile is reused by all eight row tiles of the block while it is still
+in L1. I tried a $4 \times 16$ tile as well, which was slower (190\,ms against 199\,ms at
+$N=4096,\ d=64$ but 63\,ms against 42\,ms at $N=2048$), and padded the row stride of $K^\top$ to
+$N+16$, which helped the $8 \times 8$ tile at $d=128$ (283\,ms against 338\,ms). Index
+arithmetic has to be done in \texttt{size\_t}: with \texttt{int} indices the same code executed
+$1.93\times$ more instructions and ran $1.7\times$ slower. \texttt{make check} passes with an
+error of exactly 0, since every output element still sums its terms in the original order.
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Input & Time (ms) & GFLOP/s & \% of $P_1$ & vs.\ naive & vs.\ loops \\
+\midrule
+$N=1024,\ d=64$  & 11.5  & 23.38 & 17.0 & $\times11.28$ & $\times1.29$ \\
+$N=2048,\ d=64$  & 41.7  & 25.72 & 18.7 & $\times12.57$ & $\times1.55$ \\
+$N=4096,\ d=64$  & 226.8 & 18.94 & 13.8 & $\times9.54$  & $\times1.16$ \\
+$N=4096,\ d=128$ & 331.8 & 25.89 & 18.8 & $\times15.51$ & $\times1.27$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The matmuls themselves are now much faster: at $N=1024$ they run at 49\,GFLOP/s ($QK^\top$) and
+57\,GFLOP/s ($PV$), around 40\% of peak. The overall gain is smaller because the rest of the
+program did not change. At $N=4096,\ d=64$ the steps take 72\,ms ($QK^\top$), 70\,ms (softmax)
+and 42\,ms ($PV$), so softmax, with its scalar \texttt{expf}, is now 38\% of the time. A large
+part of the $QK^\top$ time is spent writing the 64\,MiB matrix $S$ for the first time: it is
+freshly allocated on every call and causes about 16{,}500 page faults per call, one per 4\,KiB
+page, and in a test with $S$ already touched, $QK^\top$ dropped from 65\,ms to 40\,ms. Both of
+these costs come from materialising $S$, which is what fusion in (c) removes.
+
 \subsection*{(c) Fusion}
 \todo{}
 \subsection*{(d) Best}
