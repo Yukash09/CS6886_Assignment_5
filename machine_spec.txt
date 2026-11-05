@@ -1,0 +1,28 @@
+# Machine specification (Q1). Fill in every field; give units. Fill in N/A if not applicable.
+
+CPU model                       : AMD Ryzen 5 7520U with Radeon Graphics
+Microarchitecture               : Zen 2 (Mendocino, family 17h model A0h, 6 nm)
+Physical cores                  : 4
+Logical cores (hardware threads): 8 (2-way SMT)
+Performance / efficiency cores  : N/A (4 identical cores, all max 4.39 GHz; not hybrid)
+Base clock (GHz)                : 2.8 GHz
+Max single-core clock (GHz)     : 4.3 GHz (rated; observed 4.29 GHz, cpuinfo_max_freq 4.39 GHz)
+All-core clock under load (GHz) : ~4.07 GHz (TODO: re-measure with sustained AVX2 load, see notes)
+SIMD instruction set and width  : AVX2 + FMA3, 256-bit (8 x FP32); no AVX-512
+FMA units per core              : 2 (256-bit FMA pipes FP0/FP1)
+Vector registers per core       : 16 architectural YMM registers (256-bit) per hardware thread
+L1 data cache (per core)        : 32 KiB, 8-way, 64 B lines (shared by the core's 2 SMT threads)
+L2 cache (size, shared by)      : 512 KiB per core, private to one core (its 2 SMT threads); 2 MiB total
+L3 cache (size, shared by)      : 4 MiB, shared by all 4 cores (one CCX)
+Cache line size (bytes)         : 64
+RAM size (GB)                   : 16 GB (15.6 GB visible to the OS)
+RAM type, speed (MT/s), channels: LPDDR5, 5500 MT/s, 2 channels x 32-bit (64-bit total bus) (dmidecode)
+Operating system                : Fedora Linux 43 (Workstation), kernel 7.2.13-100.fc43.x86_64
+Compiler and version            : clang 21.1.8 (Fedora 21.1.8-6.fc43), flags -O3 -march=native
+
+# Derived (show the calculation in report.pdf)
+Peak FP32 GFLOP/s, one core     : 137.6 GFLOP/s  (4.3 GHz x 8 lanes x 2 FMA units x 2 FLOP/FMA = 32 FLOP/cycle)
+Peak FP32 GFLOP/s, all cores    : ~521 GFLOP/s   (4 cores x 32 FLOP/cycle x 4.07 GHz; update if the all-core clock changes)
+Memory bandwidth (GB/s)         : 15.5 GB/s measured (STREAM Triad, 4 threads); 8.1 GB/s with 1 thread; theoretical peak 44.0 GB/s (5500 MT/s x 8 B)
+Ridge point, one core (FLOP/B)  : 17.1 FLOP/B  (137.6 GFLOP/s / 8.06 GB/s, 1-thread Triad)
+Ridge point, all cores (FLOP/B) : 33.5 FLOP/B  (521 GFLOP/s / 15.53 GB/s, 4-thread Triad)

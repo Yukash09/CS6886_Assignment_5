@@ -1,0 +1,25 @@
+variant,N,d,threads,time_ms,gflops,arithmetic_intensity_flop_per_byte,make_check
+naive,1024,64,1,129.504,2.07,,N/A (reference)
+naive,2048,64,1,524.811,2.05,,N/A (reference)
+naive,4096,64,1,2163.008,1.99,,N/A (reference)
+naive,4096,128,1,5146.463,1.67,,N/A (reference)
+loops,1024,64,1,,,,
+loops,2048,64,1,,,,
+loops,4096,64,1,,,,
+loops,4096,128,1,,,,
+tiled,1024,64,1,,,,
+tiled,2048,64,1,,,,
+tiled,4096,64,1,,,,
+tiled,4096,128,1,,,,
+fused,1024,64,1,,,,
+fused,2048,64,1,,,,
+fused,4096,64,1,,,,
+fused,4096,128,1,,,,
+best,1024,64,1,,,,
+best,2048,64,1,,,,
+best,4096,64,1,,,,
+best,4096,128,1,,,,
+omp,1024,64,,,,,
+omp,2048,64,,,,,
+omp,4096,64,,,,,
+omp,4096,128,,,,,

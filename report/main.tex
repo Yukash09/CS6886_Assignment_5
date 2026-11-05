@@ -1,0 +1,148 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+% Red placeholder. Search for \todo before submitting.
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\title{CS6886 Assignment 5: Optimising Attention on a CPU}
+\author{Yukash Ram CS23B069 \\ \small \url{https://github.com/Yukash09/CS6886_Assignment_5}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent All measurements were taken with the laptop on AC power, using clang 21.1.8 with
+\texttt{-O3 -march=native}. Each reported time is the driver's median of 5 runs after one
+warm-up run, and GFLOP/s is the driver's $4N^2d/t$.
+
+% ===========================================================================
+\section*{Q1: Machine}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+CPU & AMD Ryzen 5 7520U, Zen 2 (Mendocino) \\
+Cores & 4 physical, 8 logical (SMT), no P/E split \\
+Clock & base 2.8\,GHz, max 4.3\,GHz, all-core under load 4.07\,GHz \\
+SIMD & AVX2 + FMA3, 256-bit (8 FP32), 2 FMA units/core, 16 YMM registers \\
+Caches & L1d 32\,KiB/core, L2 512\,KiB/core, L3 4\,MiB shared, 64\,B lines \\
+Memory & 16\,GB LPDDR5-5500, 2 channels $\times$ 32-bit \\
+OS & Fedora 43, kernel 7.2.13 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Most fields come from \texttt{lscpu}, \texttt{/sys/devices/system/cpu} and
+\texttt{dmidecode}; the base clock is from AMD's product page and the FMA count from
+\todo{cite Zen 2 FMA source}. The all-core clock was read from \texttt{scaling\_cur\_freq}
+while all 8 hardware threads were busy. \todo{re-check with turbostat under AVX2 load}
+
+\paragraph{Peak FP32.} A 256-bit FMA operates on 8 floats and counts as 2 FLOP per float, and
+each core has two FMA units, so a core can do 32 FLOP per cycle. Using the single-core boost
+clock for one core and the measured all-core clock for four,
+\[
+  P_1 = 32 \times 4.3\,\text{GHz} = 137.6\ \text{GFLOP/s}, \qquad
+  P_4 = 4 \times 32 \times 4.07\,\text{GHz} = 521\ \text{GFLOP/s}.
+\]
+Only physical cores are counted, since the two SMT threads of a core share its FMA units.
+
+\paragraph{Memory bandwidth.} The memory bus is 64 bits wide (two 32-bit channels), so at
+5500\,MT/s the theoretical bandwidth is $5500 \times 10^6 \times 8\,\text{B} = 44.0$\,GB/s.
+STREAM Triad, run with 76\,MiB arrays so that nothing fits in the L3, measures
+$B_1 = 8.06$\,GB/s with one thread and $B_4 = 15.5$\,GB/s with four. These measured values are
+what the code can actually reach, so they are the ones used for the roofline.
+
+\paragraph{Ridge point.} A kernel with arithmetic intensity $I$ (FLOP per byte of DRAM traffic)
+can reach at most $\min(P,\ I \cdot B)$, and the two limits meet at $I^\ast = P/B$:
+\[
+  I^\ast_1 = 137.6 / 8.06 = 17.1\ \text{FLOP/B}, \qquad
+  I^\ast_4 = 521 / 15.5 = 33.5\ \text{FLOP/B}.
+\]
+
+% ===========================================================================
+\section*{Q2: Naive baseline}
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Input & Time (ms) & GFLOP/s & \% of $P_1$ \\
+\midrule
+$N=1024,\ d=64$  & 129.5  & 2.07 & 1.50 \\
+$N=2048,\ d=64$  & 524.8  & 2.05 & 1.49 \\
+$N=4096,\ d=64$  & 2163.0 & 1.99 & 1.45 \\
+$N=4096,\ d=128$ & 5146.5 & 1.67 & 1.21 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Scaling.} The work grows as $N^2d$, so doubling $N$ should cost $\times4$ and
+doubling $d$ should cost $\times2$. Doubling $N$ costs $\times4.05$ and $\times4.12$, which means
+the cost per FLOP barely changes with $N$: the inner loops are limited by the core (the
+dependent FMA chain described below) rather than by memory. Doubling $d$ costs $\times2.38$, and
+the two matmul steps slow down for different reasons. To separate the effect of $d$ from the
+effect of data size, I also timed random inputs at $N=1024,\ d=128$. $QK^\top$ runs at about
+2.0\,GFLOP/s at $d=128$ for both $N=1024$ and $N=4096$, so its slowdown does not depend on data
+size; it comes from the longer chain of dependent FMAs in each dot product, which leaves less
+overlap between consecutive dot products. $PV$, on the other hand, grows by $\times2.10$ from
+$d=64$ to $128$ at $N=1024$ but by $\times2.53$ at $N=4096$, which points to memory. Hardware
+counters confirm this: at $N=4096$, going to $d=128$ raises the L2 miss rate from 53\% to 74\%,
+and both L2 misses and L1 TLB misses per FLOP roughly double. This follows from the larger
+stride ($4d = 512$\,B) with which step 3 walks down the columns of $V$.
+
+\paragraph{Where the time goes.} I put timers around the three steps in a copy of
+\texttt{attn\_naive.c} (median of 5 runs):
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Input & $QK^\top$ (ms) & softmax (ms) & $PV$ (ms) \\
+\midrule
+$N=1024,\ d=64$  & 46.7   & 3.9  & 78.9   \\
+$N=2048,\ d=64$  & 193.9  & 16.4 & 319.2  \\
+$N=4096,\ d=64$  & 799.7  & 65.2 & 1306.8 \\
+$N=4096,\ d=128$ & 2150.2 & 64.9 & 3216.4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Across all inputs, $PV$ takes about 60\% of the time, $QK^\top$ about 37\% and softmax
+only 3\%. The main reason both matmul steps are slow is that they are not vectorised. clang
+reports that it \emph{cannot prove it is safe to reorder floating-point operations} in the
+\texttt{acc += \dots} loops, and the disassembly confirms that the hot loop is a scalar
+\texttt{vfmadd231ss}. Each of these FMAs does 2 FLOP and has to wait about 5 cycles for the
+previous one to finish, which limits the loop to roughly 0.4 FLOP per cycle against a peak of 32.
+\texttt{perf stat} agrees, giving an IPC of 1.45 and about 0.49 FLOP per cycle at $N=1024$,
+which is why naive reaches only about 1.5\% of peak.
+
+$PV$ is slower than $QK^\top$ even though both do the same number of FLOPs, because of how they
+access memory. $QK^\top$ reads $K$ along its rows with a 4-byte stride, so every byte of each
+cache line it loads is used. $PV$ reads $V$ down its columns with a stride of $4d = 256$\,B, so
+every load touches a new cache line and uses only 4 of its 64 bytes. Softmax is cheap despite
+its scalar \texttt{expf} calls (clang reports \emph{call instruction cannot be vectorized})
+because it does $O(N^2)$ work, compared with $O(N^2d)$ for each matmul. The $N \times N$ matrix
+is not yet a bottleneck either: at $N=4096$, $S$ is 64\,MiB and makes about four passes through
+DRAM, roughly 0.27\,GB or 33\,ms at 8.06\,GB/s, which is under 2\% of the runtime.
+
+% ===========================================================================
+\section*{Q3: Optimisations}
+\subsection*{(a) Loop reordering}
+\todo{}
+\subsection*{(b) Cache and register tiling}
+\todo{}
+\subsection*{(c) Fusion}
+\todo{}
+\subsection*{(d) Best}
+\todo{}
+
+\section*{Q4: OpenMP}
+\todo{}
+
+\section*{Q5: Roofline}
+\todo{}
+
+\end{document}

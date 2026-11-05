@@ -1,0 +1,6 @@
+build/
+output/
+report/*.aux
+report/*.log
+report/*.out
+report/main.pdf
