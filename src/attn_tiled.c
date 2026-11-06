@@ -21,7 +21,7 @@
 /* ------------------------------------------------------------------------- */
 #define R 8 
 #define C 8 
-#define IB 64
+#define IB 16
 
 void attention(const float *Q, const float *K, const float *V, float *O, int N, int d)
 {
