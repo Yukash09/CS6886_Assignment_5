@@ -40,7 +40,8 @@ OS & Fedora 43, kernel 7.2.13 \\
 \noindent Most fields come from \texttt{lscpu}, \texttt{/sys/devices/system/cpu} and
 \texttt{dmidecode}; the base clock is from AMD's product page and the FMA count from
 \todo{cite Zen 2 FMA source}. The all-core clock was read from \texttt{scaling\_cur\_freq}
-while all 8 hardware threads were busy. \todo{re-check with turbostat under AVX2 load}
+while all 8 hardware threads were busy, and again under the AVX2 load of the OpenMP variant
+(4.03--4.16\,GHz with 4 or 8 threads, 4.24\,GHz with one).
 
 \paragraph{Peak FP32.} A 256-bit FMA operates on 8 floats and counts as 2 FLOP per float, and
 each core has two FMA units, so a core can do 32 FLOP per cycle. Using the single-core boost
@@ -176,8 +177,10 @@ loop then loads one 8-wide row of $K^\top$ (or $V$) and broadcasts eight scalars
 and the outputs are stored only once per tile. Eight independent accumulators also hide most of
 the FMA latency. For cache tiling, rows are processed in blocks of 64, so that the small slice of
 $K^\top$ or $V$ used by a tile is reused by all eight row tiles of the block while it is still
-in L1. I tried a $4 \times 16$ tile as well, which was slower (190\,ms against 199\,ms at
-$N=4096,\ d=64$ but 63\,ms against 42\,ms at $N=2048$), and padded the row stride of $K^\top$ to
+in L1. I measured blocks of 16 to 256 rows afterwards: 16 rows was fastest on every input, 2--8\%
+faster than the 64 used here, and 256 the slowest. I also tried a
+$4 \times 16$ tile, which was slightly faster at $N=4096,\ d=64$ (190\,ms against 199\,ms) but
+much slower at $N=2048$ (63\,ms against 42\,ms), and padded the row stride of $K^\top$ to
 $N+16$, which helped the $8 \times 8$ tile at $d=128$ (283\,ms against 338\,ms). Index
 arithmetic has to be done in \texttt{size\_t}: with \texttt{int} indices the same code executed
 $1.93\times$ more instructions and ran $1.7\times$ slower. \texttt{make check} passes with an
@@ -240,10 +243,91 @@ instead of DRAM. The three steps now take similar time (48\,ms $QK^\top$, 49\,ms
 the matmuls still run below half of peak.
 
 \subsection*{(d) Best}
-\todo{}
 
+\texttt{attn\_best.c} starts from \texttt{attn\_fused.c} and makes two changes. The first is a
+vectorised softmax. \texttt{expf} is a library call that clang cannot vectorise, so I wrote
+\texttt{fast\_exp}, which computes $e^x = 2^n e^r$ with $n = \lfloor x\log_2 e + 0.5\rfloor$
+and $|r| \le \ln 2/2$, evaluates $e^r$ with a degree-6 polynomial (Cephes \texttt{expf}
+coefficients), and builds $2^n$ directly from the exponent bits. The row max and row sum are
+kept in 8 independent lanes, so that neither is a single serial reduction. With this alone, the
+softmax at $N=4096,\ d=64$ dropped from 49\,ms to 26\,ms and the whole kernel from 151\,ms to
+about 114\,ms.
+
+The second change is the online softmax used by FlashAttention (Milakov and Gimelshein, 2018).
+Each block of 64 query rows now walks through the keys in tiles of $B_c$ columns, keeping a
+running maximum $m$, sum $\ell$ and output $o$ per row. For each tile, the new maximum
+$m'$ gives $\alpha = e^{m - m'}$, then $\ell \leftarrow \alpha\ell + \sum_j e^{s_j - m'}$ and
+$o \leftarrow \alpha o + \sum_j e^{s_j - m'} v_j$, and $O = o/\ell$ after the last tile. The
+score buffer shrinks from $64 \times N$ (1\,MiB at $N=4096$, larger than L2) to
+$64 \times B_c$. With $B_c = 256$ the score tile and the matching slices of $K^\top$ and $V$
+take 64\,KiB each and stay in the 512\,KiB L2, and L2 misses at $N=4096,\ d=64$ fell from
+$108\times10^6$ to $3.8\times10^6$. Tiles of 128 and 512 columns were within a few percent of
+256 and 1024 was 10--20\% slower. Row blocks of 16 to 128 changed $d=64$ by under 3\%; at
+$d=128$, 16 and 32 rows were 9--30\% slower and 128 rows 3\% faster than 64, so I kept 64. \texttt{make check}
+passes, with errors of at most $4.4\times10^{-6}$.
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Input & Time (ms) & GFLOP/s & \% of $P_1$ & vs.\ naive & vs.\ fused \\
+\midrule
+$N=1024,\ d=64$  & 5.9   & 45.33 & 32.9 & $\times21.87$ & $\times1.45$ \\
+$N=2048,\ d=64$  & 23.3  & 46.13 & 33.5 & $\times22.54$ & $\times1.54$ \\
+$N=4096,\ d=64$  & 95.7  & 44.86 & 32.6 & $\times22.59$ & $\times1.58$ \\
+$N=4096,\ d=128$ & 180.4 & 47.62 & 34.6 & $\times28.53$ & $\times1.49$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+What limits \texttt{attn\_best.c} now is the matmul code itself, at about a third of peak. The
+$8 \times 8$ register tile written in plain C leaves the compiler to schedule loads and FMAs,
+and changing its shape ($4 \times 16$, $2 \times 32$, $8 \times 16$) moved the time by under
+5\%, while $16 \times 8$ needs more than the 16 vector registers and was $2.7\times$ slower.
+Going further would need a hand-written micro-kernel with intrinsics.
+
+% ===========================================================================
 \section*{Q4: OpenMP}
-\todo{}
+
+\texttt{attn\_omp.c} is \texttt{attn\_best.c} with two OpenMP directives. The transpose of $K$
+is split across threads with \texttt{parallel for}, and the loop over 64-row blocks is shared
+with \texttt{omp for}, each thread allocating its own score tile. Each block writes its own rows
+of $O$, so no synchronisation is needed, and the output is identical to \texttt{attn\_best.c}.
+Times are medians of three runs after a warm-up run.
+
+\begin{center}
+\begin{tabular}{@{}r rrr rrr@{}}
+\toprule
+ & \multicolumn{3}{c}{$N=4096,\ d=64$} & \multicolumn{3}{c}{$N=4096,\ d=128$} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Threads & Time (ms) & Speedup & Efficiency & Time (ms) & Speedup & Efficiency \\
+\midrule
+1 & 98.8 & 1.00 & 100\% & 184.8 & 1.00 & 100\% \\
+2 & 50.1 & 1.97 & 99\%  & 91.4  & 2.02 & 101\% \\
+3 & 35.7 & 2.77 & 92\%  & 73.3  & 2.52 & 84\%  \\
+4 & 27.3 & 3.61 & 90\%  & 54.3  & 3.40 & 85\%  \\
+6 & 27.7 & 3.57 & 60\%  & 52.4  & 3.53 & 59\%  \\
+8 & 26.2 & 3.77 & 47\%  & 50.4  & 3.67 & 46\%  \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent At $N=1024$ and $N=2048$ the speedups are similar ($\times3.81$ and $\times3.78$ on 4
+threads, $\times3.90$ and $\times3.77$ on 8; all rows are in \texttt{results.csv}). With 8
+threads the kernel reaches 164--177\,GFLOP/s, about a third of the all-core peak of
+521\,GFLOP/s.
+
+Scaling is close to linear up to 4 threads, one per physical core. It stays below $\times4$
+partly because the clock falls from 4.24\,GHz with one busy core to 4.03--4.16\,GHz with four.
+Three threads reach only 84--92\%, and pinning them to separate cores did not change this
+(72.4\,ms against 72.6\,ms at $d=128$), so I cannot attribute it to thread placement. Beyond 4
+threads there is almost no gain, because the extra threads are SMT siblings that share a core's
+FMA units and load ports, and the kernel is limited by what each core can execute rather than
+by memory. Placing 4
+threads on only two physical cores (\texttt{OMP\_PLACES=threads}, \texttt{OMP\_PROC\_BIND=close})
+makes $N=4096,\ d=64$ take 46\,ms instead of 25\,ms. The loop uses
+\texttt{schedule(dynamic)}: with a static schedule, 6 threads gave every thread the same number
+of blocks, so the threads sharing a core finished last and the run took 32\,ms, against 25\,ms
+with a dynamic schedule. At 4 and 8 threads the two schedules performed the same.
 
 \section*{Q5: Roofline}
 \todo{}
